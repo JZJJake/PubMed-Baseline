@@ -23,7 +23,10 @@ class VectorStore:
 
         # Check for GPU availability
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Initializing VectorStore with device: {self.device}")
+        if self.device == "cpu":
+            print("Warning: CUDA not detected. Using CPU for embeddings (slower).")
+        else:
+            print(f"Initializing VectorStore with device: {self.device}")
 
         # Use sentence-transformers for embeddings
         # 'all-MiniLM-L6-v2' is a good balance of speed and quality
@@ -37,6 +40,42 @@ class VectorStore:
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"} # Use cosine similarity
         )
+
+    def reset_db(self, metadata_file: str = None):
+        """
+        Reset the vector database and checkpoint file.
+        Use this if the database is corrupted.
+        """
+        print("[Warning] Resetting vector database. All indexed data will be lost.")
+
+        # 1. Remove the checkpoint file if it exists
+        if metadata_file:
+            checkpoint_path = self._get_checkpoint_path(metadata_file)
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                print(f"Deleted checkpoint: {checkpoint_path}")
+
+        # 2. Reset the client/collection
+        # Note: ChromaDB PersistentClient doesn't have a simple 'delete_database' method exposed easily,
+        # but we can just delete the collection or the folder. Deleting the folder is safer for "corruption".
+
+        # We need to close the client reference if possible, but python's GC usually handles it.
+        # However, to delete the folder, we should ensure no locks are held.
+        # Simply deleting the collection might not fix file corruption.
+
+        try:
+            self.client.delete_collection(COLLECTION_NAME)
+            print("Deleted ChromaDB collection.")
+        except Exception as e:
+            print(f"Error deleting collection: {e}")
+
+        # Re-create
+        self.collection = self.client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=self.embedding_fn,
+            metadata={"hnsw:space": "cosine"}
+        )
+        print("Vector database reset complete.")
 
     def _get_checkpoint_path(self, metadata_file: str) -> str:
         """Generate checkpoint file path based on metadata file path."""

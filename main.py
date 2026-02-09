@@ -116,8 +116,10 @@ class PubMedShell(cmd.Cmd):
 
 ### 3. index (构建索引)
 将解析后的数据构建为向量索引，以便进行语义检索。建议在每次 parse 后运行一次。
-* **用法**: `index [batch_size]`
-* **示例**: `index`
+* **用法**: `index [batch_size] [--reset|-r]`
+* **示例**:
+    - `index`
+    - `index --reset` (重建索引，清空旧数据)
 
 ### 4. search (搜索文献)
 检索本地文献。支持关键词匹配和语义检索。
@@ -173,10 +175,18 @@ class PubMedShell(cmd.Cmd):
             logger.exception(f"发生错误: {e}")
 
     def do_index(self, arg):
+        args = shlex.split(arg)
         batch_size = 100
-        if arg:
+        reset = False
+
+        if "-r" in args or "--reset" in args:
+            reset = True
+            # Remove flags from args
+            args = [a for a in args if a not in ("-r", "--reset")]
+
+        if args:
             try:
-                batch_size = int(arg)
+                batch_size = int(args[0])
             except ValueError:
                 pass
         
@@ -185,6 +195,15 @@ class PubMedShell(cmd.Cmd):
         if vs:
             metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
             try:
+                if reset:
+                    # Using rich.prompt.Confirm for better UX
+                    from rich.prompt import Confirm
+                    if Confirm.ask("此操作将删除所有现有索引并重新开始，确认吗？", default=False):
+                         vs.reset_db(metadata_file)
+                    else:
+                        console.print("操作已取消。")
+                        return
+
                 # vs.index_papers uses tqdm, so we don't wrap in status
                 vs.index_papers(metadata_file, batch_size=batch_size)
                 console.print("[bold green]索引构建完成！[/bold green]")
