@@ -1,0 +1,12 @@
+aiohttp
+beautifulsoup4
+click
+lxml
+requests
+tqdm
+pytest
+openai
+python-dotenv
+sentence-transformers
+chromadb
+rich
