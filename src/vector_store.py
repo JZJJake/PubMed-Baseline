@@ -136,7 +136,7 @@ class VectorStore:
         documents = results['documents'][0]
         
         for i, doc_id in enumerate(ids):
-            meta = metadatas[i]
+            meta = metas[i]
             doc_text = documents[i]
             
             # Simple parsing of our stored doc format:
