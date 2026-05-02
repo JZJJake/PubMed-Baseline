@@ -197,3 +197,11 @@ def clear_task_data(task_id: str):
 
 # Initialize on import
 init_db()
+
+def get_pending_count(task_id: str) -> int:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM urls WHERE task_id = ? AND status = "pending"', (task_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count

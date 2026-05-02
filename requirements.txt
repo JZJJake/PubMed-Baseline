@@ -10,3 +10,10 @@ pyinstaller
 jinja2
 readability-lxml
 playwright-stealth
+
+tqdm
+chromadb
+sentence-transformers
+openai
+rich
+python-dotenv
