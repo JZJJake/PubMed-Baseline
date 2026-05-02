@@ -1,348 +1,172 @@
-import sys
-import shlex
-import cmd
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import uuid
 import os
-import json
-import logging
-from dotenv import load_dotenv
-from rich.console import Console
-from rich.table import Table
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.logging import RichHandler
-from rich.prompt import Prompt
-from src.downloader import sync_files
-from src.parser import parse_all
-from src.ai import DeepSeekAgent
-from src.vector_store import VectorStore
+import webbrowser
+import threading
+import uvicorn
+import asyncio
+import sys
 
-# Configure Rich Console and Logging
-console = Console()
-logging.basicConfig(
-    level="INFO",
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
-)
-logger = logging.getLogger("PubMed")
+import db_manager
+from scraper import crawl_worker, task_events
 
-# Load environment variables
-load_dotenv()
+# Support for PyInstaller paths
+if getattr(sys, 'frozen', False):
+    # If the application is run as a bundle, the PyInstaller bootloader
+    # extends the sys module by a flag frozen=True and sets the app
+    # path into variable _MEIPASS'.
+    application_path = sys._MEIPASS
+else:
+    application_path = os.path.dirname(os.path.abspath(__file__))
 
-# Initialize VectorStore lazily
-vector_store = None
+static_dir = os.path.join(application_path, "static")
+if not os.path.exists(static_dir):
+    os.makedirs(static_dir, exist_ok=True)
 
-def get_vector_store():
-    global vector_store
-    if vector_store is None:
-        try:
-            vector_store = VectorStore()
-        except Exception as e:
-            logger.error(f"初始化向量数据库失败: {e}")
-            return None
-    return vector_store
+from contextlib import asynccontextmanager
 
-def find_candidates(keyword, limit=20, use_vector=False):
-    """
-    Search for candidates in metadata.jsonl or via VectorStore.
-    Returns a list of dictionaries.
-    """
-    if use_vector:
-        vs = get_vector_store()
-        if vs:
-            try:
-                return vs.search(keyword, limit=limit)
-            except Exception as e:
-                logger.warning(f"向量搜索失败: {e}。将回退到关键词搜索。")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This runs when the app starts up
+    # Pre-install browsers before launching the UI so it doesn't fail when hitting start
+    install_playwright_browsers()
 
-    # Fallback to keyword search
-    metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
-    matches = []
-    
-    if not os.path.exists(metadata_file):
-        return matches
+    # Spawn the browser asynchronously after startup
+    import asyncio
+    async def open_browser_async():
+        await asyncio.sleep(0.5) # Slight delay to let uvicorn print its startup message
+        webbrowser.open('http://127.0.0.1:8000')
+
+    asyncio.create_task(open_browser_async())
+
+    yield
+    # This runs when the app shuts down
+    pass
+
+app = FastAPI(title="Web Scraper Client", lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+class ScrapeRequest(BaseModel):
+    url: str
+    show_browser: bool = True
+    update_data: bool = False
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    index_path = os.path.join(static_dir, "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/console", response_class=HTMLResponse)
+async def get_console():
+    console_path = os.path.join(static_dir, "console.html")
+    with open(console_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.post("/api/scrape/start")
+async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTasks):
+    task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, request.url))
+
+    if request.update_data:
+        await asyncio.to_thread(db_manager.clear_task_data, task_id)
+
+    task = await asyncio.to_thread(db_manager.get_task, task_id)
+    if not task:
+        await asyncio.to_thread(db_manager.create_task, task_id, request.url, request.url)
+
+    # If the task is already running in memory, don't start a new one
+    if task_id in task_events and not task_events[task_id]['stop'].is_set():
+         return {"task_id": task_id, "status": "already running or paused"}
+
+    # Make sure status is set to running
+    await asyncio.to_thread(db_manager.update_task_status, task_id, "running")
+
+    background_tasks.add_task(
+        crawl_worker,
+        task_id,
+        request.url,
+        not request.show_browser
+    )
+
+    return {"task_id": task_id, "status": "started"}
+
+@app.get("/api/scrape/status/{task_id}")
+async def get_scraping_status(task_id: str):
+    task = await asyncio.to_thread(db_manager.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # In concurrent mode, "current" isn't just one pending, it's multiple processing
+    # Let's just return a count of active links or a general label
+    active_count = await asyncio.to_thread(db_manager.get_active_count, task_id)
+
+    return {
+        "status": task['status'],
+        "pages_scraped": task['total_scraped'],
+        "current_url": f"{active_count} 个页面正在队列中...",
+        "is_running": task['status'] == 'running'
+    }
+
+@app.get("/api/scrape/tree/{task_id}")
+async def get_scrape_tree(task_id: str):
+    tree_data = await asyncio.to_thread(db_manager.get_url_tree, task_id)
+    return {"tree": tree_data}
+
+@app.post("/api/scrape/pause/{task_id}")
+async def pause_scraping(task_id: str):
+    if task_id in task_events:
+        task_events[task_id]['pause'].clear()
+        await asyncio.to_thread(db_manager.update_task_status, task_id, "paused")
+    return {"status": "paused"}
+
+@app.post("/api/scrape/resume/{task_id}")
+async def resume_scraping(task_id: str):
+    if task_id in task_events:
+        task_events[task_id]['pause'].set()
+        await asyncio.to_thread(db_manager.update_task_status, task_id, "running")
+    else:
+        # Task may have fully stopped, so we can't just resume, we must restart the worker loop via /start
+        pass
+    return {"status": "resumed"}
+
+@app.post("/api/scrape/stop/{task_id}")
+async def stop_scraping(task_id: str):
+    if task_id in task_events:
+        task_events[task_id]['stop'].set()
+        # Unpause in case it's paused so it can process the stop signal
+        task_events[task_id]['pause'].set()
+    await asyncio.to_thread(db_manager.update_task_status, task_id, "stopped")
+    return {"status": "stopped"}
+
+
+def install_playwright_browsers():
+    """Ensure playwright browsers are installed before starting."""
+    print("Checking/installing Playwright browsers...")
+    # This environment variable forces Playwright to install and look for browsers
+    # in the local folder structure, rather than a global appdata folder which might
+    # fail or be hidden when running as a PyInstaller executable.
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
+    # Check if we're running as a frozen executable
+    if getattr(sys, 'frozen', False):
+        print("Running as a frozen executable. Skipping automatic playwright install since sys.executable points to this executable.")
+        return
 
     try:
-        with open(metadata_file, "r", encoding="utf-8") as f:
-            count = 0
-            for line in f:
-                try:
-                    data = json.loads(line)
-                    text = (data.get("title", "") + " " + data.get("abstract", "")).lower()
-                    
-                    if keyword.lower() in text:
-                        matches.append(data)
-                        count += 1
-                        if count >= limit:
-                            break
-                except json.JSONDecodeError:
-                    continue
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        print("Playwright browsers ready.")
     except Exception as e:
-        logger.error(f"读取元数据时出错: {e}")
-        
-    return matches
+        print(f"Warning: Failed to install playwright browsers automatically. Error: {e}")
 
-class PubMedShell(cmd.Cmd):
-    intro = "" # We will print a custom banner
-    prompt = "[bold cyan](PubMed)[/bold cyan] "
-    
-    def preloop(self):
-        banner = """
-[bold blue]PubMed 智能文献助手[/bold blue]
-[dim]v2.0 - Powered by DeepSeek & ChromaDB[/dim]
+if __name__ == "__main__":
+    os.makedirs("static", exist_ok=True)
+    os.makedirs("scraped_data", exist_ok=True)
 
-输入 [bold green]help[/bold green] 查看使用指南。
-输入 [bold green]exit[/bold green] 退出程序。
-"""
-        console.print(Panel(banner, style="cyan"))
-
-    def do_help(self, arg):
-        """显示帮助信息"""
-        help_text = """
-# 使用指南
-
-欢迎使用 PubMed 智能文献工作台。本软件集成了文献下载、解析、向量检索与 AI 问答功能。
-
-## 常用命令
-
-### 1. sync (同步数据)
-从 PubMed FTP 服务器下载最新的 XML 数据文件。
-* **用法**: `sync [数量]`
-* **示例**: `sync 5` (下载前5个文件)
-
-### 2. parse (解析数据)
-将下载的 XML.gz 文件解析为本地可读的 JSONL 格式。
-* **用法**: `parse`
-
-### 3. index (构建索引)
-将解析后的数据构建为向量索引，以便进行语义检索。建议在每次 parse 后运行一次。
-* **用法**: `index [batch_size]`
-* **示例**: `index`
-
-### 4. search (搜索文献)
-检索本地文献。支持关键词匹配和语义检索。
-* **用法**: `search <关键词> [数量] [-v]`
-* **参数**:
-    - `-v`: 启用语义检索 (需先运行 index)
-* **示例**: 
-    - `search "lung cancer" 10` (关键词匹配)
-    - `search "treatment for headache" -v` (语义检索)
-
-### 5. ask (AI 问答)
-利用 DeepSeek AI 回答问题，并基于本地文献提供依据。
-* **用法**: `ask <问题>`
-* **示例**: `ask "最新肺癌免疫疗法的进展如何？"`
-
-### 6. config (配置)
-设置 API Key 等环境变量。
-* **用法**: `config <KEY> <VALUE>`
-* **示例**: `config DEEPSEEK_API_KEY sk-xxxxx`
-
-### 7. exit
-退出程序。
-"""
-        console.print(Markdown(help_text))
-
-    def do_sync(self, arg):
-        limit = None
-        if arg:
-            try:
-                limit = int(arg)
-            except ValueError:
-                logger.error("参数错误: limit 必须是整数。")
-                return
-        
-        try:
-            with console.status("[bold green]正在同步文件...[/bold green]"):
-                sync_files(limit=limit)
-            console.print("[bold green]同步完成！[/bold green]")
-        except KeyboardInterrupt:
-            console.print("\n[yellow]操作已取消。[/yellow]")
-        except Exception as e:
-            logger.exception(f"发生错误: {e}")
-
-    def do_parse(self, arg):
-        try:
-            # Note: parse_all internally uses tqdm, which might conflict slightly with rich console if not handled carefully,
-            # but usually it's fine. We won't wrap it in console.status to let tqdm show progress.
-            parse_all()
-            console.print("[bold green]解析完成！[/bold green]")
-        except KeyboardInterrupt:
-            console.print("\n[yellow]操作已取消。[/yellow]")
-        except Exception as e:
-            logger.exception(f"发生错误: {e}")
-
-    def do_index(self, arg):
-        batch_size = 100
-        if arg:
-            try:
-                batch_size = int(arg)
-            except ValueError:
-                pass
-        
-        console.print("[cyan]正在初始化向量数据库...[/cyan]")
-        vs = get_vector_store()
-        if vs:
-            metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
-            try:
-                # vs.index_papers uses tqdm, so we don't wrap in status
-                vs.index_papers(metadata_file, batch_size=batch_size)
-                console.print("[bold green]索引构建完成！[/bold green]")
-            except KeyboardInterrupt:
-                console.print("\n[yellow]操作已取消。[/yellow]")
-            except Exception as e:
-                logger.exception(f"索引过程中出错: {e}")
-        else:
-            logger.error("无法初始化向量数据库，请检查依赖库是否安装。")
-
-    def do_search(self, arg):
-        if not arg:
-            logger.error("参数错误: 请提供搜索关键字。")
-            return
-            
-        args = shlex.split(arg)
-        use_vector = False
-        if "-v" in args:
-            use_vector = True
-            args.remove("-v")
-            
-        if not args:
-            logger.error("请提供搜索关键字。")
-            return
-            
-        keyword = args[0]
-        limit = 10
-        if len(args) > 1:
-            try:
-                limit = int(args[1])
-            except ValueError:
-                logger.error("参数错误: limit 必须是整数。")
-                return
-
-        search_type = "语义检索" if use_vector else "关键词匹配"
-        console.print(f"正在搜索 [bold cyan]'{keyword}'[/bold cyan] ({search_type})...")
-        
-        matches = find_candidates(keyword, limit, use_vector=use_vector)
-
-        if not matches:
-            console.print("[yellow]未找到匹配项。[/yellow]")
-            return
-
-        table = Table(title=f"搜索结果: {keyword} ({len(matches)})")
-        table.add_column("PMID", style="cyan", no_wrap=True)
-        table.add_column("标题", style="white")
-        table.add_column("年份", style="green")
-        table.add_column("期刊", style="magenta")
-
-        for m in matches:
-            table.add_row(
-                m['pmid'],
-                m['title'][:100] + "..." if len(m['title']) > 100 else m['title'],
-                m.get('year', 'N/A'),
-                m.get('journal', 'N/A')
-            )
-        
-        console.print(table)
-
-    def do_config(self, arg):
-        args = shlex.split(arg)
-        if len(args) != 2:
-            logger.error("用法错误。示例: config DEEPSEEK_API_KEY sk-12345")
-            return
-            
-        key, value = args
-        env_file = ".env"
-        
-        # Update .env file
-        lines = []
-        if os.path.exists(env_file):
-            with open(env_file, "r") as f:
-                lines = f.readlines()
-        
-        key_found = False
-        new_lines = []
-        for line in lines:
-            if line.strip().startswith(f"{key}="):
-                new_lines.append(f"{key}={value}\n")
-                key_found = True
-            else:
-                if not line.endswith("\n"):
-                    line += "\n"
-                new_lines.append(line)
-        
-        if not key_found:
-            if new_lines and not new_lines[-1].endswith("\n"):
-                new_lines[-1] += "\n"
-            new_lines.append(f"{key}={value}\n")
-            
-        with open(env_file, "w") as f:
-            f.writelines(new_lines)
-            
-        os.environ[key] = value
-        console.print(f"[green]配置已更新: {key} 已保存。[/green]")
-
-    def do_ask(self, arg):
-        if not arg:
-            logger.error("请提供问题。")
-            return
-            
-        try:
-            api_key = os.getenv("DEEPSEEK_API_KEY")
-            agent = DeepSeekAgent(api_key=api_key)
-        except ValueError as e:
-            logger.error(f"无法初始化 AI Agent: {e}")
-            console.print("[yellow]请使用 'config DEEPSEEK_API_KEY <your_key>' 设置 API Key。[/yellow]")
-            return
-
-        with console.status("[cyan]正在分析问题并提取关键词...[/cyan]"):
-            keyword = agent.extract_keywords(arg)
-        console.print(f"检索关键词: [bold]{keyword}[/bold]")
-        
-        candidates = []
-        vs = get_vector_store()
-        
-        if vs:
-            console.print("[dim]尝试使用语义检索...[/dim]")
-            try:
-                candidates = vs.search(arg, limit=10)
-                if not candidates:
-                    console.print("[dim]语义检索未找到结果，尝试关键词检索...[/dim]")
-            except Exception as e:
-                logger.warning(f"语义检索出错 ({e})，转为关键词检索...")
-        
-        if not candidates:
-            candidates = find_candidates(keyword, limit=10, use_vector=False)
-        
-        if not candidates:
-            console.print(f"[red]未找到关于 '{keyword}' 的相关文献。尝试换个问法？[/red]")
-            return
-            
-        console.print(f"[green]找到 {len(candidates)} 篇相关文献，正在生成回答...[/green]\n")
-        console.rule("[bold blue]AI 回答[/bold blue]")
-        
-        try:
-            response_text = ""
-            for chunk in agent.chat(arg, candidates):
-                response_text += chunk
-                console.print(chunk, end="", highlight=False, markup=False) # Print raw chunk to stream
-            console.print("\n")
-            console.rule("[bold blue]结束[/bold blue]")
-        except KeyboardInterrupt:
-            console.print("\n[yellow]回答中止。[/yellow]")
-        except Exception as e:
-            logger.exception(f"\n发生错误: {e}")
-
-    def do_exit(self, arg):
-        """退出程序。"""
-        console.print("[bold blue]再见！[/bold blue]")
-        return True
-    
-    def do_quit(self, arg):
-        """退出程序。"""
-        return self.do_exit(arg)
-
-if __name__ == '__main__':
-    try:
-        PubMedShell().cmdloop()
-    except KeyboardInterrupt:
-        print("\n程序已退出。")
+    # We pass the app object directly rather than a string "main:app"
+    # because string references often fail when packaged by PyInstaller.
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
