@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网页全量信息智能提取客户端</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fa;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        input[type="url"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        button {
+            flex: 1;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button.update-btn {
+            background-color: #e67e22;
+        }
+        button.update-btn:hover {
+            background-color: #d35400;
+        }
+        .notice {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #666;
+            background: #eef2f5;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 4px solid #3498db;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>网页全量信息智能提取客户端</h1>
+
+    <div class="form-group">
+        <label for="url">目标网址 (URL) - 将自动递归抓取该目录下的所有页面</label>
+        <input type="url" id="url" placeholder="https://example.com/docs/" required>
+    </div>
+
+    <div class="form-group checkbox-group">
+        <input type="checkbox" id="show-browser" checked>
+        <label for="show-browser" style="margin-bottom: 0; font-weight: normal;">显示浏览器界面 (取消勾选可后台静默爬取)</label>
+    </div>
+
+    <div class="notice">
+        <b>工作流说明：</b><br>
+        1. 系统会自动构建数据链并防止重复爬取。<br>
+        2. 点击开始后将打开一个独立的控制台窗口，用于显示数据树状地图并提供断点续传控制。<br>
+        3. <b>续传/抓取</b>：自动接续之前的进度进行抓取。<br>
+        4. <b>重新初始化(更新)</b>：清空该网址的历史记录，从头开始全量抓取。
+    </div>
+
+    <div class="btn-group">
+        <button onclick="startTask(false)">开始/继续抓取</button>
+        <button class="update-btn" onclick="startTask(true)">重新初始化(更新数据)</button>
+    </div>
+</div>
+
+<script>
+    async function startTask(isUpdate) {
+        const urlInput = document.getElementById('url').value;
+        const showBrowser = document.getElementById('show-browser').checked;
+
+        if (!urlInput) {
+            alert('请输入有效的网址！');
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/scrape/start', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    url: urlInput,
+                    show_browser: showBrowser,
+                    update_data: isUpdate
+                })
+            });
+
+            const data = await response.json();
+
+            if (response.ok && data.task_id) {
+                // Open console in a new independent window
+                const consoleUrl = `/console?taskId=${data.task_id}`;
+                window.open(consoleUrl, 'ScraperConsole_' + data.task_id, 'width=1000,height=800,menubar=no,toolbar=no,location=no,status=no');
+            } else {
+                alert('启动任务失败: ' + (data.detail || JSON.stringify(data)));
+            }
+        } catch (error) {
+            alert(`请求错误：${error.message}`);
+        }
+    }
+</script>
+
+</body>
+</html>

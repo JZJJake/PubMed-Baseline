@@ -1,65 +1,53 @@
-import sys
-import shlex
 import cmd
+import shlex
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import json
 import logging
-from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
-from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.logging import RichHandler
-from rich.prompt import Prompt
-from src.downloader import sync_files
-from src.parser import parse_all
-from src.ai import DeepSeekAgent
-from src.vector_store import VectorStore
+from rich.markdown import Markdown
+from rich.table import Table
+import uuid
+import asyncio
 
-# Configure Rich Console and Logging
+import pubmed_src.downloader as pubmed_downloader
+import pubmed_src.parser as pubmed_parser
+import pubmed_src.vector_store as pubmed_vs
+from pubmed_src.ai import DeepSeekAgent
+
+from scraper import crawl_worker
+import db_manager
+
 console = Console()
-logging.basicConfig(
-    level="INFO",
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)]
-)
-logger = logging.getLogger("PubMed")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("pubmed_cli")
 
-# Load environment variables
-load_dotenv()
+def sync_files(limit=None):
+    pubmed_downloader.sync_files(limit=limit)
 
-# Initialize VectorStore lazily
-vector_store = None
+def parse_all():
+    pubmed_parser.parse_all()
 
 def get_vector_store():
-    global vector_store
-    if vector_store is None:
-        try:
-            vector_store = VectorStore()
-        except Exception as e:
-            logger.error(f"初始化向量数据库失败: {e}")
-            return None
-    return vector_store
+    return pubmed_vs.get_vector_store()
 
-def find_candidates(keyword, limit=20, use_vector=False):
-    """
-    Search for candidates in metadata.jsonl or via VectorStore.
-    Returns a list of dictionaries.
-    """
-    if use_vector:
-        vs = get_vector_store()
-        if vs:
-            try:
-                return vs.search(keyword, limit=limit)
-            except Exception as e:
-                logger.warning(f"向量搜索失败: {e}。将回退到关键词搜索。")
-
-    # Fallback to keyword search
-    metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
+def find_candidates(keyword, limit=10, use_vector=False):
     matches = []
-    
+
+    if use_vector:
+        try:
+            vs = get_vector_store()
+            if vs:
+                return vs.search(keyword, limit=limit)
+        except Exception as e:
+            logger.error(f"向量检索失败 ({e})，降级为文本检索...")
+
+    # Text search fallback
+    metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
     if not os.path.exists(metadata_file):
+        logger.error("未找到数据文件。请先运行 parse。")
         return matches
 
     try:
@@ -69,7 +57,7 @@ def find_candidates(keyword, limit=20, use_vector=False):
                 try:
                     data = json.loads(line)
                     text = (data.get("title", "") + " " + data.get("abstract", "")).lower()
-                    
+
                     if keyword.lower() in text:
                         matches.append(data)
                         count += 1
@@ -79,13 +67,13 @@ def find_candidates(keyword, limit=20, use_vector=False):
                     continue
     except Exception as e:
         logger.error(f"读取元数据时出错: {e}")
-        
+
     return matches
 
 class PubMedShell(cmd.Cmd):
     intro = "" # We will print a custom banner
     prompt = "[bold cyan](PubMed)[/bold cyan] "
-    
+
     def preloop(self):
         banner = """
 [bold blue]PubMed 智能文献助手[/bold blue]
@@ -124,7 +112,7 @@ class PubMedShell(cmd.Cmd):
 * **用法**: `search <关键词> [数量] [-v]`
 * **参数**:
     - `-v`: 启用语义检索 (需先运行 index)
-* **示例**: 
+* **示例**:
     - `search "lung cancer" 10` (关键词匹配)
     - `search "treatment for headache" -v` (语义检索)
 
@@ -138,7 +126,15 @@ class PubMedShell(cmd.Cmd):
 * **用法**: `config <KEY> <VALUE>`
 * **示例**: `config DEEPSEEK_API_KEY sk-xxxxx`
 
-### 7. exit
+### 7. webui (Web 界面)
+启动或重启 Web 界面服务。
+* **用法**: `webui`
+
+### 8. spider (网页爬虫)
+启动智能爬虫分析和爬取网页。
+* **用法**: `spider <URL>`
+
+### 9. exit
 退出程序。
 """
         console.print(Markdown(help_text))
@@ -151,7 +147,7 @@ class PubMedShell(cmd.Cmd):
             except ValueError:
                 logger.error("参数错误: limit 必须是整数。")
                 return
-        
+
         try:
             with console.status("[bold green]正在同步文件...[/bold green]"):
                 sync_files(limit=limit)
@@ -163,8 +159,6 @@ class PubMedShell(cmd.Cmd):
 
     def do_parse(self, arg):
         try:
-            # Note: parse_all internally uses tqdm, which might conflict slightly with rich console if not handled carefully,
-            # but usually it's fine. We won't wrap it in console.status to let tqdm show progress.
             parse_all()
             console.print("[bold green]解析完成！[/bold green]")
         except KeyboardInterrupt:
@@ -179,13 +173,12 @@ class PubMedShell(cmd.Cmd):
                 batch_size = int(arg)
             except ValueError:
                 pass
-        
+
         console.print("[cyan]正在初始化向量数据库...[/cyan]")
         vs = get_vector_store()
         if vs:
             metadata_file = os.path.join(os.path.dirname(__file__), "data", "metadata.jsonl")
             try:
-                # vs.index_papers uses tqdm, so we don't wrap in status
                 vs.index_papers(metadata_file, batch_size=batch_size)
                 console.print("[bold green]索引构建完成！[/bold green]")
             except KeyboardInterrupt:
@@ -199,17 +192,17 @@ class PubMedShell(cmd.Cmd):
         if not arg:
             logger.error("参数错误: 请提供搜索关键字。")
             return
-            
+
         args = shlex.split(arg)
         use_vector = False
         if "-v" in args:
             use_vector = True
             args.remove("-v")
-            
+
         if not args:
             logger.error("请提供搜索关键字。")
             return
-            
+
         keyword = args[0]
         limit = 10
         if len(args) > 1:
@@ -221,7 +214,7 @@ class PubMedShell(cmd.Cmd):
 
         search_type = "语义检索" if use_vector else "关键词匹配"
         console.print(f"正在搜索 [bold cyan]'{keyword}'[/bold cyan] ({search_type})...")
-        
+
         matches = find_candidates(keyword, limit, use_vector=use_vector)
 
         if not matches:
@@ -241,7 +234,7 @@ class PubMedShell(cmd.Cmd):
                 m.get('year', 'N/A'),
                 m.get('journal', 'N/A')
             )
-        
+
         console.print(table)
 
     def do_config(self, arg):
@@ -249,16 +242,15 @@ class PubMedShell(cmd.Cmd):
         if len(args) != 2:
             logger.error("用法错误。示例: config DEEPSEEK_API_KEY sk-12345")
             return
-            
+
         key, value = args
         env_file = ".env"
-        
-        # Update .env file
+
         lines = []
         if os.path.exists(env_file):
             with open(env_file, "r") as f:
                 lines = f.readlines()
-        
+
         key_found = False
         new_lines = []
         for line in lines:
@@ -269,23 +261,51 @@ class PubMedShell(cmd.Cmd):
                 if not line.endswith("\n"):
                     line += "\n"
                 new_lines.append(line)
-        
+
         if not key_found:
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines[-1] += "\n"
             new_lines.append(f"{key}={value}\n")
-            
+
         with open(env_file, "w") as f:
             f.writelines(new_lines)
-            
+
         os.environ[key] = value
         console.print(f"[green]配置已更新: {key} 已保存。[/green]")
+
+    def do_spider(self, arg):
+        """Launch the intelligent Web Spider to crawl a URL and auto-detect SPA/API endpoints.
+        Usage: spider <URL>
+        Example: spider https://m.x-mol.com/paper/tag/academicArea/chem
+        """
+        if not arg:
+            console.print("[bold red]Please provide a URL to crawl.[/bold red]")
+            return
+
+        url = arg.strip()
+        task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+
+        console.print(f"[bold green]Initializing Smart Spider for:[/bold green] {url}")
+        console.print("[dim]The spider will automatically detect if the site is a static HTML page or a dynamic SPA (Single Page Application).[/dim]")
+
+        db_manager.init_db()
+        db_manager.create_task(task_id, url, url)
+
+        try:
+            console.print(f"Task ID: {task_id}")
+            console.print("Crawling in progress (press Ctrl+C to stop)...")
+            asyncio.run(crawl_worker(task_id, url, headless=True))
+            console.print("[bold green]Crawling finished![/bold green] Data saved to the 'scraped_data' directory.")
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Crawling interrupted by user.[/bold yellow]")
+        except Exception as e:
+            console.print(f"[bold red]Spider error:[/bold red] {e}")
 
     def do_ask(self, arg):
         if not arg:
             logger.error("请提供问题。")
             return
-            
+
         try:
             api_key = os.getenv("DEEPSEEK_API_KEY")
             agent = DeepSeekAgent(api_key=api_key)
@@ -297,10 +317,10 @@ class PubMedShell(cmd.Cmd):
         with console.status("[cyan]正在分析问题并提取关键词...[/cyan]"):
             keyword = agent.extract_keywords(arg)
         console.print(f"检索关键词: [bold]{keyword}[/bold]")
-        
+
         candidates = []
         vs = get_vector_store()
-        
+
         if vs:
             console.print("[dim]尝试使用语义检索...[/dim]")
             try:
@@ -309,22 +329,22 @@ class PubMedShell(cmd.Cmd):
                     console.print("[dim]语义检索未找到结果，尝试关键词检索...[/dim]")
             except Exception as e:
                 logger.warning(f"语义检索出错 ({e})，转为关键词检索...")
-        
+
         if not candidates:
             candidates = find_candidates(keyword, limit=10, use_vector=False)
-        
+
         if not candidates:
             console.print(f"[red]未找到关于 '{keyword}' 的相关文献。尝试换个问法？[/red]")
             return
-            
+
         console.print(f"[green]找到 {len(candidates)} 篇相关文献，正在生成回答...[/green]\n")
         console.rule("[bold blue]AI 回答[/bold blue]")
-        
+
         try:
             response_text = ""
             for chunk in agent.chat(arg, candidates):
                 response_text += chunk
-                console.print(chunk, end="", highlight=False, markup=False) # Print raw chunk to stream
+                console.print(chunk, end="", highlight=False, markup=False)
             console.print("\n")
             console.rule("[bold blue]结束[/bold blue]")
         except KeyboardInterrupt:
@@ -332,16 +352,38 @@ class PubMedShell(cmd.Cmd):
         except Exception as e:
             logger.exception(f"\n发生错误: {e}")
 
+    def do_webui(self, arg):
+        console.print("[green]正在后台启动 WebUI...[/green]")
+        import threading
+        import uvicorn
+        from web_app import app # we will move the FastAPI app to web_app.py
+
+        def run_server():
+            # Use uvicorn.run dynamically
+            try:
+                uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+            except Exception as e:
+                print(f"Server error: {e}")
+
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+        console.print("[green]WebUI 启动成功！访问 http://127.0.0.1:8000[/green]")
+
     def do_exit(self, arg):
         """退出程序。"""
         console.print("[bold blue]再见！[/bold blue]")
         return True
-    
+
     def do_quit(self, arg):
         """退出程序。"""
         return self.do_exit(arg)
 
 if __name__ == '__main__':
+    # Initial setup
+    os.makedirs("static", exist_ok=True)
+    os.makedirs("scraped_data", exist_ok=True)
+
+    # Start CLI
     try:
         PubMedShell().cmdloop()
     except KeyboardInterrupt:
