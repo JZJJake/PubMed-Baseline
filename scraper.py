@@ -113,6 +113,11 @@ async def download_image(session, img_url, save_path):
     return False
 
 def determine_static_boundary(start_url):
+    parsed = urllib.parse.urlparse(start_url)
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+    # original code disabled below
+
     """
     Determines the strict physical generic boundary.
     Extracts the parent directory of the current directory to include siblings and their children.
@@ -159,7 +164,7 @@ def get_sub_domain_links(html, current_url, base_url, dynamic_root_prefix=None):
 
         if parsed_url.scheme in ['http', 'https'] and ext not in ignored_extensions:
             # Check if it is the base_url itself, or a child path of the base_prefix (case-insensitive)
-            if full_url.lower() == base_url.lower() or full_url.lower().startswith(base_prefix.lower()):
+            if parsed_url.netloc == urllib.parse.urlparse(base_prefix).netloc:
                 links.append(full_url)
     return list(set(links))
 
@@ -596,6 +601,8 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
                                 # Ignore images/media
                                 if not any(v.lower().endswith(ext) for ext in ['.jpg', '.png', '.gif', '.css', '.js']):
                                     api_links.add(v)
+                            elif isinstance(v, str) and k == 'doi':
+                                api_links.add(f"https://onlinelibrary.wiley.com/doi/abs/{v}")
                 elif isinstance(node, list):
                     for item in node:
                         text += parse_json_node(item, depth + 1)
@@ -616,7 +623,7 @@ async def process_single_url(task_id: str, current_url: str, start_url: str, bas
                 full_url = urllib.parse.urljoin(current_url, link)
                 full_url = urllib.parse.urldefrag(full_url)[0]
                 parsed_url = urllib.parse.urlparse(full_url)
-                if parsed_url.scheme in ['http', 'https'] and full_url.lower().startswith(dynamic_root.lower()):
+                if parsed_url.scheme in ['http', 'https']:
                     valid_api_links.append(full_url)
 
             if valid_api_links:
